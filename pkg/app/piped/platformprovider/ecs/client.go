@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -317,38 +318,66 @@ func (c *client) getLoadBalancerArn(ctx context.Context, targetGroupArn string) 
 	return output.TargetGroups[0].LoadBalancerArns[0], nil
 }
 
+func (c *client) getPrimaryRuleArn(ctx context.Context, listenerArn string) (string, error) {
+	input := &elasticloadbalancingv2.DescribeRulesInput{
+		ListenerArn: aws.String(listenerArn),
+	}
+	output, err := c.elbClient.DescribeRules(ctx, input)
+	if err != nil {
+		return "", err
+	}
+	if len(output.Rules) == 0 {
+		return "", platformprovider.ErrNotFound
+	}
+
+	rules := output.Rules
+	sort.SliceStable(rules, func(i, j int) bool {
+		return *rules[i].Priority < *rules[j].Priority
+	})
+
+	return *rules[0].RuleArn, nil
+}
+
+func (c *client) modifyRule(ctx context.Context, ruleArn string, routingTrafficCfg RoutingTrafficConfig) error {
+	if len(routingTrafficCfg) != 2 {
+		return fmt.Errorf("invalid rule configuration: requires 2 target groups")
+	}
+
+	input := &elasticloadbalancingv2.ModifyRuleInput{
+		RuleArn: aws.String(ruleArn),
+		Actions: []elbtypes.Action{
+			{
+				Type: elbtypes.ActionTypeEnumForward,
+				ForwardConfig: &elbtypes.ForwardActionConfig{
+					TargetGroups: []elbtypes.TargetGroupTuple{
+						{
+							TargetGroupArn: aws.String(routingTrafficCfg[0].TargetGroupArn),
+							Weight:         aws.Int32(int32(routingTrafficCfg[0].Weight)),
+						},
+						{
+							TargetGroupArn: aws.String(routingTrafficCfg[1].TargetGroupArn),
+							Weight:         aws.Int32(int32(routingTrafficCfg[1].Weight)),
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := c.elbClient.ModifyRule(ctx, input)
+	return err
+}
+
 func (c *client) ModifyListeners(ctx context.Context, listenerArns []string, routingTrafficCfg RoutingTrafficConfig) error {
 	if len(routingTrafficCfg) != 2 {
 		return fmt.Errorf("invalid listener configuration: requires 2 target groups")
 	}
 
-	modifyListener := func(ctx context.Context, listenerArn string) error {
-		input := &elasticloadbalancingv2.ModifyListenerInput{
-			ListenerArn: aws.String(listenerArn),
-			DefaultActions: []elbtypes.Action{
-				{
-					Type: elbtypes.ActionTypeEnumForward,
-					ForwardConfig: &elbtypes.ForwardActionConfig{
-						TargetGroups: []elbtypes.TargetGroupTuple{
-							{
-								TargetGroupArn: aws.String(routingTrafficCfg[0].TargetGroupArn),
-								Weight:         aws.Int32(int32(routingTrafficCfg[0].Weight)),
-							},
-							{
-								TargetGroupArn: aws.String(routingTrafficCfg[1].TargetGroupArn),
-								Weight:         aws.Int32(int32(routingTrafficCfg[1].Weight)),
-							},
-						},
-					},
-				},
-			},
-		}
-		_, err := c.elbClient.ModifyListener(ctx, input)
-		return err
-	}
-
 	for _, listener := range listenerArns {
-		if err := modifyListener(ctx, listener); err != nil {
+		ruleArn, err := c.getPrimaryRuleArn(ctx, listener)
+		if err != nil {
+			return err
+		}
+		if err := c.modifyRule(ctx, ruleArn, routingTrafficCfg); err != nil {
 			return err
 		}
 	}
