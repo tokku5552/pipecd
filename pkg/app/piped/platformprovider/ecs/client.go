@@ -261,7 +261,8 @@ func (c *client) WaitServiceStable(ctx context.Context, service types.Service) e
 		}
 
 		svc := output.Services[0]
-		if svc.PendingCount == 0 && svc.RunningCount >= svc.DesiredCount {
+
+		if svc.PendingCount == 0 && svc.RunningCount >= svc.DesiredCount*2 {
 			return nil, nil
 		}
 
